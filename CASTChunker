@@ -1,0 +1,428 @@
+/// <summary>
+/// cAST Chunking Algorithm (Algorithm 1 from EMNLP 2025)
+/// Recursive split-then-merge:
+/// - Top-down: try to keep large nodes whole
+/// - If too large: split recursively
+/// - Merge small siblings for density
+/// Size metric: non-whitespace characters
+/// </summary>
+public class CASTChunker
+{
+    private readonly int _maxChunkSize;
+    private readonly ILogger<CASTChunker> _logger;
+    private readonly Dictionary<string, TreeSitterParser> _parsers;
+
+    public CASTChunker(int maxChunkSize = 2000, ILogger<CASTChunker> logger = null)
+    {
+        _maxChunkSize = maxChunkSize;
+        _logger = logger;
+        _parsers = new Dictionary<string, TreeSitterParser>();
+        InitializeParsers();
+    }
+
+    /// <summary>
+    /// Initialize tree-sitter parsers for supported languages
+    /// </summary>
+    private void InitializeParsers()
+    {
+        try
+        {
+            // C# parser
+            var csParser = new TreeSitterParser("csharp");
+            _parsers["csharp"] = csParser;
+            _logger?.LogInformation("✓ Initialized C# parser");
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning($"✗ Failed to init C# parser: {ex.Message}");
+        }
+
+        try
+        {
+            // C++ parser
+            var cppParser = new TreeSitterParser("cpp");
+            _parsers["cpp"] = cppParser;
+            _logger?.LogInformation("✓ Initialized C++ parser");
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning($"✗ Failed to init C++ parser: {ex.Message}");
+        }
+
+        try
+        {
+            // Java parser
+            var javaParser = new TreeSitterParser("java");
+            _parsers["java"] = javaParser;
+            _logger?.LogInformation("✓ Initialized Java parser");
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning($"✗ Failed to init Java parser: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Parse and chunk file using cAST algorithm
+    /// </summary>
+    public List<CodeChunk> ChunkFile(string filePath, string code, string language)
+    {
+        if (!_parsers.ContainsKey(language))
+        {
+            _logger?.LogWarning($"No parser for {language}, using fallback");
+            return FallbackChunking(filePath, code, language);
+        }
+
+        try
+        {
+            var parser = _parsers[language];
+            var tree = parser.Parse(code);
+            var codeBytes = Encoding.UTF8.GetBytes(code);
+
+            // Apply cAST algorithm to root node's children
+            var astChunks = ChunkAstNodes(
+                tree.RootNode.Children,
+                codeBytes,
+                _maxChunkSize
+            );
+
+            // Convert to CodeChunk objects
+            var chunks = new List<CodeChunk>();
+            for (int i = 0; i < astChunks.Count; i++)
+            {
+                var chunk = CreateCodeChunk(
+                    astChunks[i],
+                    codeBytes,
+                    filePath,
+                    language,
+                    i
+                );
+                chunks.Add(chunk);
+            }
+
+            return chunks;
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError($"Failed to parse {filePath}: {ex.Message}");
+            return FallbackChunking(filePath, code, language);
+        }
+    }
+
+    /// <summary>
+    /// cAST Algorithm: Recursive split-then-merge
+    /// Size metric: non-whitespace character count
+    /// </summary>
+    private List<List<TreeSitterNode>> ChunkAstNodes(
+        IEnumerable<TreeSitterNode> nodes,
+        byte[] code,
+        int maxChunkSize)
+    {
+        var chunks = new List<List<TreeSitterNode>>();
+        var currentChunk = new List<TreeSitterNode>();
+        int currentSize = 0;
+
+        foreach (var node in nodes)
+        {
+            // Get non-whitespace character count (from paper)
+            var nodeText = GetNodeText(node, code);
+            var nodeSize = GetNonWhitespaceLength(nodeText);
+
+            // Case 1: Empty chunk + oversized node → recursive split
+            if (currentChunk.Count == 0 && nodeSize > maxChunkSize)
+            {
+                if (node.Children.Any())
+                {
+                    var subChunks = ChunkAstNodes(
+                        node.Children,
+                        code,
+                        maxChunkSize
+                    );
+                    chunks.AddRange(subChunks);
+                }
+                else
+                {
+                    chunks.Add(new List<TreeSitterNode> { node });
+                }
+                continue;
+            }
+
+            // Case 2: Would exceed limit → start new chunk
+            if (currentChunk.Count > 0 && (currentSize + nodeSize) > maxChunkSize)
+            {
+                chunks.Add(currentChunk);
+                currentChunk = new List<TreeSitterNode>();
+                currentSize = 0;
+
+                // Handle oversized node
+                if (nodeSize > maxChunkSize)
+                {
+                    if (node.Children.Any())
+                    {
+                        var subChunks = ChunkAstNodes(
+                            node.Children,
+                            code,
+                            maxChunkSize
+                        );
+                        chunks.AddRange(subChunks);
+                    }
+                    else
+                    {
+                        chunks.Add(new List<TreeSitterNode> { node });
+                    }
+                    continue;
+                }
+            }
+
+            // Case 3: Add to current chunk (merge)
+            currentChunk.Add(node);
+            currentSize += nodeSize;
+        }
+
+        if (currentChunk.Count > 0)
+        {
+            chunks.Add(currentChunk);
+        }
+
+        return chunks;
+    }
+
+    /// <summary>
+    /// Create CodeChunk from AST nodes
+    /// </summary>
+    private CodeChunk CreateCodeChunk(
+        List<TreeSitterNode> astNodes,
+        byte[] code,
+        string filePath,
+        string language,
+        int chunkIndex)
+    {
+        // Extract text from byte range
+        int startByte = astNodes.Min(n => n.StartByte);
+        int endByte = astNodes.Max(n => n.EndByte);
+        string chunkText = Encoding.UTF8.GetString(code, startByte, endByte - startByte);
+
+        // Calculate size (non-whitespace)
+        int size = GetNonWhitespaceLength(chunkText);
+
+        // Generate chunk ID
+        string chunkHash = GetMd5Hash(chunkText).Substring(0, 8);
+        string chunkId = $"{filePath}:chunk_{chunkIndex}:{chunkHash}";
+
+        // Line numbers
+        int startLine = astNodes.Min(n => n.StartPoint.Row) + 1;
+        int endLine = astNodes.Max(n => n.EndPoint.Row) + 1;
+
+        // Collect node types
+        var nodeTypes = astNodes
+            .Select(n => n.Type)
+            .Distinct()
+            .ToList();
+
+        // Analyze complexity & extract docstring
+        string fullCode = Encoding.UTF8.GetString(code);
+        int complexity = EstimateComplexity(chunkText);
+        string docstring = ExtractDocstring(chunkText, filePath, startLine, fullCode);
+
+        return new CodeChunk
+        {
+            ChunkId = chunkId,
+            CodeText = chunkText,
+            Size = size,
+            AstNodeTypes = nodeTypes,
+            FilePath = filePath,
+            ModuleId = Path.GetDirectoryName(filePath),
+            Language = language,
+            StartLine = startLine,
+            EndLine = endLine,
+            RelativePath = Path.GetFileName(filePath),
+            Complexity = complexity,
+            Docstring = docstring,
+            ChunkHash = chunkHash
+        };
+    }
+
+    /// <summary>
+    /// Estimate cyclomatic complexity
+    /// </summary>
+    private int EstimateComplexity(string code)
+    {
+        int complexity = 1;
+        var keywords = new[] { "if", "else", "for", "foreach", "while", "case", "catch", "&&", "||" };
+
+        foreach (var keyword in keywords)
+        {
+            complexity += Regex.Matches(code, Regex.Escape(keyword)).Count;
+        }
+
+        return complexity;
+    }
+
+    /// <summary>
+    /// Extract docstring/comments
+    /// </summary>
+    private string ExtractDocstring(string chunkText, string filePath, int startLine, string fullCode)
+    {
+        var lines = fullCode.Split('\n');
+        var docs = new List<string>();
+
+        for (int i = startLine - 2; i >= Math.Max(-1, startLine - 20); i--)
+        {
+            if (i < lines.Length)
+            {
+                var line = lines[i].Trim();
+                if (line.StartsWith("///") || line.StartsWith("//"))
+                {
+                    var trimmedLine = line.StartsWith("///")
+                        ? line.Substring(3)
+                        : line.Substring(2);
+                    docs.Insert(0, trimmedLine);
+                }
+                else if (!string.IsNullOrWhiteSpace(line))
+                {
+                    break;
+                }
+            }
+        }
+
+        return string.Join("\n", docs);
+    }
+
+    /// <summary>
+    /// Fallback: Simple line-based chunking
+    /// </summary>
+    private List<CodeChunk> FallbackChunking(string filePath, string code, string language)
+    {
+        _logger?.LogWarning($"Using fallback chunking for {filePath}");
+        var lines = code.Split('\n');
+        var chunks = new List<CodeChunk>();
+
+        var currentLines = new List<string>();
+        int currentSize = 0;
+        int chunkIndex = 0;
+
+        for (int i = 0; i < lines.Length; i++)
+        {
+            var line = lines[i];
+            int lineSize = GetNonWhitespaceLength(line);
+
+            if (currentSize + lineSize > _maxChunkSize && currentLines.Count > 0)
+            {
+                string chunkText = string.Join("\n", currentLines);
+                chunks.Add(new CodeChunk
+                {
+                    ChunkId = $"{filePath}:chunk_{chunkIndex}",
+                    CodeText = chunkText,
+                    Size = currentSize,
+                    AstNodeTypes = new List<string> { "code_block" },
+                    FilePath = filePath,
+                    ModuleId = Path.GetDirectoryName(filePath),
+                    Language = language,
+                    StartLine = i - currentLines.Count + 1,
+                    EndLine = i,
+                    RelativePath = Path.GetFileName(filePath),
+                    ChunkHash = GetMd5Hash(chunkText).Substring(0, 8)
+                });
+
+                currentLines.Clear();
+                currentSize = 0;
+                chunkIndex++;
+            }
+
+            currentLines.Add(line);
+            currentSize += lineSize;
+        }
+
+        if (currentLines.Count > 0)
+        {
+            string chunkText = string.Join("\n", currentLines);
+            chunks.Add(new CodeChunk
+            {
+                ChunkId = $"{filePath}:chunk_{chunkIndex}",
+                CodeText = chunkText,
+                Size = currentSize,
+                AstNodeTypes = new List<string> { "code_block" },
+                FilePath = filePath,
+                ModuleId = Path.GetDirectoryName(filePath),
+                Language = language,
+                StartLine = lines.Length - currentLines.Count + 1,
+                EndLine = lines.Length,
+                RelativePath = Path.GetFileName(filePath),
+                ChunkHash = GetMd5Hash(chunkText).Substring(0, 8)
+            });
+        }
+
+        return chunks;
+    }
+
+    /// <summary>
+    /// Get text from node using byte offsets
+    /// </summary>
+    private string GetNodeText(TreeSitterNode node, byte[] code)
+    {
+        try
+        {
+            return Encoding.UTF8.GetString(code, node.StartByte, node.EndByte - node.StartByte);
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Get non-whitespace character count
+    /// </summary>
+    private int GetNonWhitespaceLength(string text)
+    {
+        return text.Count(c => !char.IsWhiteSpace(c));
+    }
+
+    /// <summary>
+    /// Get MD5 hash of text
+    /// </summary>
+    private string GetMd5Hash(string text)
+    {
+        using (var md5 = MD5.Create())
+        {
+            byte[] hash = md5.ComputeHash(Encoding.UTF8.GetBytes(text));
+            return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+        }
+    }
+}
+
+/// <summary>
+/// Placeholder for TreeSitter integration in C#
+/// In production, use a C# wrapper like TreeSitter.NET or similar
+/// </summary>
+public class TreeSitterParser
+{
+    private readonly string _language;
+
+    public TreeSitterParser(string language)
+    {
+        _language = language;
+    }
+
+    public TreeSitterTree Parse(string code)
+    {
+        // This would integrate with a C# tree-sitter binding
+        // For now, returns a mock implementation
+        return new TreeSitterTree { RootNode = new TreeSitterNode() };
+    }
+}
+
+public class TreeSitterTree
+{
+    public TreeSitterNode RootNode { get; set; }
+}
+
+public class TreeSitterNode
+{
+    public string Type { get; set; }
+    public int StartByte { get; set; }
+    public int EndByte { get; set; }
+    public (int Row, int Column) StartPoint { get; set; }
+    public (int Row, int Column) EndPoint { get; set; }
+    public List<TreeSitterNode> Children { get; set; } = new List<TreeSitterNode>();
+}
